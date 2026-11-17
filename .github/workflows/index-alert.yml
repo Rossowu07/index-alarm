@@ -1,0 +1,30 @@
+name: index-alert
+
+on:
+  schedule:
+    - cron: "45 0 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "只傳一則 Discord 測試訊息"
+        type: boolean
+        default: false
+
+concurrency:
+  group: index-alert
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python index_alert.py ${{ inputs.test && '--test' || '--ci' }}
