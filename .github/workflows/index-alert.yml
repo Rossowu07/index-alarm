@@ -3,6 +3,7 @@ name: index-alert
 on:
   schedule:
     - cron: "45 0 * * 1-5"
+    - cron: "15 0 * * 1-5"
   workflow_dispatch:
     inputs:
       test:
