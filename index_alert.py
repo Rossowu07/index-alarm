@@ -155,6 +155,7 @@ class State:
         if len(hist) >= MA_N:
             ma = sum(hist[-MA_N:]) / MA_N
             bias = (avg - ma) / ma * 100
+            print(f"  {hhmm} {self.name} 均值 {avg:.2f}｜{MA_N}分MA {ma:.2f}｜乖離 {bias:+.2f}%", flush=True)
             th = BIAS_PCT[self.code]
             side = "正" if bias >= th else "負" if bias <= -th else None
             if side and self._cooldown_ok(side, self.cur):
@@ -162,6 +163,8 @@ class State:
                     f"【{self.name}】{hhmm} {side}乖離 {bias:+.2f}%\n"
                     f"分鐘均值 {avg:.2f}｜{MA_N}分MA {ma:.2f}｜門檻 ±{th}%"
                 )
+        else:
+            print(f"  {hhmm} {self.name} 均值 {avg:.2f}｜暖機 {len(hist)}/{MA_N}", flush=True)
 
         # 2) 分鐘均值轉向：連續 TURN_CONFIRM 根同向，且與先前確認的趨勢相反
         k = TURN_CONFIRM
