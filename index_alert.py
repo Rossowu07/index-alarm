@@ -33,6 +33,7 @@ START = dt.time(9, 0)
 END = dt.time(13, 25)           # 13:25 起為收盤試撮，預設不納入；要含尾盤可改 13:30
 STALE_SEC = 90                  # 報價時間落後超過此秒數視為無效 (休市日會自動略過)
 HOLIDAY_GRACE = dt.time(9, 10)  # --ci 模式：此時間後仍無有效報價，視為休市或連線被拒，直接結束
+NODATA_WAIT_SEC = 120           # --ci 模式：程式啟動後至少嘗試取價這麼久，才可判定無資料
 # ======================================================
 
 TZ = ZoneInfo("Asia/Taipei")
@@ -183,14 +184,17 @@ class State:
         return msgs
 
 
-def ci_action(now, got_data):
+def ci_action(now, got_data, t0):
     """--ci 模式 (GitHub Actions)：單日執行一輪就結束。
-    回傳 wait=等開盤、run=盤中監控、closed=已收盤或週末、nodata=09:10 後仍無有效報價 (休市日或取不到資料)。"""
+    回傳 wait=等開盤、run=盤中監控、closed=已收盤或週末、
+    nodata=09:10 後，且程式已實際嘗試取價至少 NODATA_WAIT_SEC 秒，仍無有效報價 (休市日或取不到資料)。
+    t0 為程式啟動時間：晚於 09:10 才手動啟動時，也會先嘗試取價，不會直接判定無資料。"""
     if now.weekday() >= 5 or now.time() > END:
         return "closed"
     if now.time() < START:
         return "wait"
-    if not got_data and now.time() >= HOLIDAY_GRACE:
+    if (not got_data and now.time() >= HOLIDAY_GRACE
+            and (now - t0).total_seconds() >= NODATA_WAIT_SEC):
         return "nodata"
     return "run"
 
@@ -205,13 +209,14 @@ def main():
     sess = None
     got_data = False
     started = False
+    t0 = dt.datetime.now(TZ)
     print(f"啟動：MA={MA_N}分、轉向確認={TURN_CONFIRM}根、{'試跑模式' if dry else '推播模式'}"
           f"{'、CI 單日模式' if ci else ''}", flush=True)
 
     while True:
         now = dt.datetime.now(TZ)
         if ci:
-            act = ci_action(now, got_data)
+            act = ci_action(now, got_data, t0)
             if act == "closed":
                 if started:
                     push(f"⏹ 今日監控結束 ({now:%H:%M})", dry)
