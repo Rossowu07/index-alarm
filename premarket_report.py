@@ -213,52 +213,103 @@ def _near_month(rows):
     return min(c, key=lambda x: x[0])[1] if c else None
 
 
-def taifex_night(today, debug=False):
-    """台指期(TX)近月夜盤（盤後交易時段）→ {last, chg, pct}。取不到回 None，不拿舊資料充數。
-    期交所規定：盤後時段的『交易日』為歸屬的次一營業日，所以早上查今天日期即可。"""
-    ymd, roc = today.strftime("%Y%m%d"), f"{today.year - 1911}{today:%m%d}"
-    # 來源 A：期交所 OpenAPI
-    try:
-        r = requests.get("https://openapi.taifex.com.tw/v1/DailyMarketReportFut", headers=UA, timeout=25)
-        rows = r.json()
+def _pack_night(last, ref, src, idx_close=None, debug=False):
+    """組裝夜盤結果，並做合理性檢查：期貨價應與現貨指數相差不大，否則視為抓錯、不採用。"""
+    if not last or not ref:
+        return None
+    if idx_close and abs(last / idx_close - 1) > 0.05:
         if debug:
-            print("[A] OpenAPI rows:", len(rows), "樣本:", rows[:1])
-        cand = [(str(x.get("ContractMonth(Week)", x.get("ContractMonth", ""))), x) for x in rows
-                if x.get("Contract") == "TX" and "盤後" in str(x.get("TradingSession", ""))
-                and str(x.get("Date", "")) in (ymd, roc)]
-        row = _near_month(cand)
-        if row:
-            last, chg = num(row.get("Last")), num(row.get("Change"))
-            if last and chg is not None:
-                return dict(last=last, chg=chg, pct=chg / (last - chg) * 100, src="OpenAPI")
+            print(f"[檢查] {src} 價格 {last} 與加權收盤 {idx_close:.0f} 差距過大，不採用")
+        return None
+    return dict(last=last, chg=last - ref, pct=(last / ref - 1) * 100, src=src)
+
+
+def taifex_night(today, idx_close=None, debug=False):
+    """台指期(TX)近月夜盤（盤後交易時段）→ {last, chg, pct, src}。取不到回 None，不拿舊資料充數。
+    期交所規定：盤後時段的『交易日』為歸屬的次一營業日，所以平日早上查今天日期即可。
+    來源順序：C 期交所行情網站(即時) → B 期交所日行情網頁 → A 期交所 OpenAPI（通常晚間才更新）。"""
+    ymd, roc = today.strftime("%Y%m%d"), f"{today.year - 1911}{today:%m%d}"
+    # 來源 C：期交所行情網站（盤後 MarketType=1）
+    try:
+        r = requests.post("https://mis.taifex.com.tw/futures/api/getQuoteList", timeout=25,
+                          headers={**UA, "Content-Type": "application/json"},
+                          json=dict(MarketType="1", SymbolType="F", KindID="1", CID="TXF", ExpireMonth="",
+                                    RowSize="全部", PageNo="", SortColumn="", AscDesc="A"))
+        j = r.json()
+        rows = (j.get("RtData") or {}).get("QuoteList") or []
+        if debug:
+            print("[C] RtCode:", j.get("RtCode"), "筆數:", len(rows), "樣本:", rows[:1])
+        cand = [x for x in rows if "/" not in str(x.get("SymbolID", "")) and num(x.get("CLastPrice"))]
+        if cand:
+            row = max(cand, key=lambda x: num(x.get("CTotalVolume")) or 0)   # 成交量最大者視為近月
+            last, ref = num(row.get("CLastPrice")), num(row.get("CRefPrice"))
+            if not ref and num(row.get("CDiff")) is not None:
+                ref = last - num(row.get("CDiff"))
+            if debug:
+                print("[C] 採用:", {k: row.get(k) for k in ("SymbolID", "DispCName", "CLastPrice", "CRefPrice",
+                                                          "CDiff", "CDiffRate", "CTotalVolume", "CTime")})
+            out = _pack_night(last, ref, "期交所行情網站", idx_close, debug)
+            if out:
+                return out
     except Exception as e:
         if debug:
-            print("[A] 失敗:", repr(e))
-    # 來源 B：期交所網頁（盤後）
+            print("[C] 失敗:", repr(e))
+    # 來源 B：期交所日行情網頁（盤後）
     try:
         r = requests.post("https://www.taifex.com.tw/cht/3/futDailyMarketReport", headers=UA, timeout=25,
                           data=dict(queryType="2", marketCode="1", MarketCode="1", dateaddcnt="",
                                     commodity_id="TX", commodity_idt="TX", commodity_id2="",
                                     queryDate=today.strftime("%Y/%m/%d")))
         from io import StringIO
-        for t in pd.read_html(StringIO(r.text)):
+        tables = pd.read_html(StringIO(r.text))
+        if debug:
+            print("[B] HTTP", r.status_code, "表格數:", len(tables))
+        for ti, t in enumerate(tables):
             t.columns = [str(c).replace(" ", "") for c in t.columns]
+            if debug:
+                print(f"[B] 表{ti} 欄位:", list(t.columns)[:20], "列數:", len(t))
+                print(t.head(3).to_string()[:600])
             if "最後成交價" in t.columns and "契約" in t.columns:
-                t = t[t["契約"].astype(str).str.strip() == "TX"]
-                if "交易時段" in t.columns:
-                    t = t[t["交易時段"].astype(str).str.contains("盤後")]
+                t = t[t["契約"].astype(str).str.strip().str.match(r"^(TX|臺股期貨)$")]
+                if "交易時段" not in t.columns:
+                    if debug:
+                        print("[B] 缺少『交易時段』欄位，無法確認是盤後資料，不採用")
+                    continue
+                t = t[t["交易時段"].astype(str).str.contains("盤後")]
                 mcol = [c for c in t.columns if "到期月份" in c][0]
-                cand = [(str(m), row) for m, (_, row) in zip(t[mcol], t.iterrows())]
-                row = _near_month(cand)
+                row = _near_month([(str(m), rw) for m, (_, rw) in zip(t[mcol], t.iterrows())])
                 if debug:
                     print("[B] 近月列:", None if row is None else dict(row))
                 if row is not None:
                     last, chg = num(row["最後成交價"]), num(row["漲跌價"])
                     if last and chg is not None:
-                        return dict(last=last, chg=chg, pct=chg / (last - chg) * 100, src="期交所網頁")
+                        out = _pack_night(last, last - chg, "期交所網頁", idx_close, debug)
+                        if out:
+                            return out
     except Exception as e:
         if debug:
             print("[B] 失敗:", repr(e))
+    # 來源 A：期交所 OpenAPI（通常當晚才更新，早上多半沒有今日盤後資料）
+    try:
+        r = requests.get("https://openapi.taifex.com.tw/v1/DailyMarketReportFut", headers=UA, timeout=25)
+        rows = r.json()
+        tx = [x for x in rows if x.get("Contract") == "TX"]
+        if debug:
+            print("[A] OpenAPI 列數:", len(rows), "TX 列數:", len(tx),
+                  "TX 日期:", sorted({str(x.get("Date")) for x in tx}),
+                  "TX 時段:", sorted({str(x.get("TradingSession")) for x in tx}))
+        cand = [(str(x.get("ContractMonth(Week)", x.get("ContractMonth", ""))), x) for x in tx
+                if "盤後" in str(x.get("TradingSession", "")) and str(x.get("Date", "")) in (ymd, roc)]
+        row = _near_month(cand)
+        if row:
+            last, chg = num(row.get("Last")), num(row.get("Change"))
+            if last and chg is not None:
+                out = _pack_night(last, last - chg, "OpenAPI", idx_close, debug)
+                if out:
+                    return out
+    except Exception as e:
+        if debug:
+            print("[A] 失敗:", repr(e))
     return None
 
 
@@ -623,7 +674,7 @@ def collect_live(today):
                     f1, t1 = row["foreign"], row["trust"]
         data["stock_chips"][code] = (dict(f1=f1, t1=t1, f5=f5, t5=t5, days=days, grade=chips_grade(f5, t5))
                                      if days >= 3 else dict(f1=None, t1=None, f5=None, t5=None, days=days, grade="資料不足"))
-    data["night"] = taifex_night(today)
+    data["night"] = taifex_night(today, idx_close=float(data["twii"]["Close"].iloc[-1]))
     data["fut_oi"] = taifex_fut_oi(last_date)
     return data
 
@@ -888,7 +939,11 @@ def check_sources():
     print("T86:", "失敗" if t is None else {c: t.get(c) for c in WATCHLIST})
     print("BFI82U:", twse_inst_total(last))
     print("\n== 期交所夜盤（今日）==")
-    print("結果:", taifex_night(today, debug=True))
+    try:
+        ic = float(yf_hist("^TWII").Close.iloc[-1])
+    except Exception:
+        ic = None
+    print("結果:", taifex_night(today, idx_close=ic, debug=True))
     print("\n== 期交所外資台指期淨未平倉 ==")
     print("結果:", taifex_fut_oi(last, debug=True))
 
