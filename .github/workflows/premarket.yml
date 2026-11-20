@@ -1,9 +1,8 @@
 name: premarket-report
 
 on:
-  schedule:
-    # 台北時間 週一～週五 08:00（UTC 00:00）。GitHub 排程常延遲 5～30 分鐘，所以訊息約在 08:05～08:30 送達
-    - cron: "0 0 * * 1-5"
+  # 不使用 GitHub 內建 schedule（會延遲且與外部觸發重複推播）。
+  # 由 cron-job.org 每個交易日 08:25 以 workflow_dispatch 觸發，並帶入 mode=run。
   workflow_dispatch:
     inputs:
       mode:
