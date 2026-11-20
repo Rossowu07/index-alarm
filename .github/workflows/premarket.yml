@@ -1,0 +1,53 @@
+name: premarket-report
+
+on:
+  schedule:
+    # 台北時間 週一～週五 08:00（UTC 00:00）。GitHub 排程常延遲 5～30 分鐘，所以訊息約在 08:05～08:30 送達
+    - cron: "0 0 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check=測試各資料來源（首次部署先跑這個）／dry-run=只算不推播／run=正式推播"
+        type: choice
+        default: check
+        options: [check, dry-run, run]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: premarket-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        env:
+          USE_LLM: ${{ vars.USE_LLM }}
+        run: |
+          pip install pandas numpy requests yfinance lxml
+          if [ "$USE_LLM" = "1" ]; then pip install anthropic; fi
+
+      - name: Run
+        env:
+          MODE: ${{ inputs.mode || 'run' }}
+          # 如果你現有監控用的 secret 名稱不同，只要改下面這一行右邊的名稱
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 選用：LLM 解讀層。在 Settings → Variables 設 USE_LLM=1，並在 Secrets 加 ANTHROPIC_API_KEY
+          USE_LLM: ${{ vars.USE_LLM }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          case "$MODE" in
+            check)   python premarket_report.py --check-sources ;;
+            dry-run) python premarket_report.py --dry-run ;;
+            *)       python premarket_report.py ;;
+          esac
