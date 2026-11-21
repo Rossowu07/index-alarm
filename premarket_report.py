@@ -520,9 +520,13 @@ def build_levels(d, ref):
     res = [x for x in lv if x[0] > ref]
     atr = float(r.atr) if pd.notna(r.atr) else ref * 0.01
     if not sup:
-        sup = [(ref - atr, "ATR下檔(無近期支撐)")]
+        sup = [(ref - atr, "ATR下檔")]
+    if len(sup) < 2:
+        sup.append((sup[0][0] - atr, "再下1×ATR"))
     if not res:
-        res = [(ref + atr, "ATR上檔(無近期壓力)")]
+        res = [(ref + atr, "ATR上檔")]
+    if len(res) < 2:
+        res.append((res[0][0] + atr, "再上1×ATR"))
     return sup[:2], res[:2], atr
 
 
@@ -566,6 +570,20 @@ def make_advice(kind, tilt, ref, sup, res, atr, ma5, hot_warn, gates, extra_warn
     return line, stop, rr
 
 
+def short_advice(kind, tilt, sup, res, stop, gates, hot_warn):
+    F = lambda v: fp(v, kind)
+    s1, r1 = sup[0][0], res[0][0]
+    if tilt == "偏多":
+        if gates:
+            return "技術偏多但" + "、".join(g.split("（")[0] for g in gates) + "，不追價"
+        if hot_warn:
+            return f"短線過熱不追高，回測{F(s1)}不破再承接"
+        return f"回測{F(s1)}不破可承接，站上{F(r1)}續攻，停損{F(stop)}"
+    if tilt == "偏空":
+        return f"反彈{F(r1)}不過觀望/減碼，跌破{F(s1)}續弱"
+    return f"{F(s1)}～{F(r1)}區間觀望，突破或跌破再跟"
+
+
 def analyze(name, df, kind, extra_score=0.0, extra_sig=None, ref_override=None,
             chips=None, fund=None, outer_warn=None):
     """回傳單一標的完整分析結果（dict）。"""
@@ -592,10 +610,11 @@ def analyze(name, df, kind, extra_score=0.0, extra_sig=None, ref_override=None,
         gates.append("法人籌碼偏弱")
     hot_warn = t["hot"]
     line, stop, rr = make_advice(kind, tilt, ref, sup, res, atr, float(r.ma5), hot_warn, gates, None)
+    short = short_advice(kind, tilt, sup, res, stop, gates, hot_warn)
     lo_rng, hi_rng = ref - CFG["atr_k"] * atr, ref + CFG["atr_k"] * atr
     return dict(name=name, kind=kind, close=close, chg=chg, ref=ref, score=score, tilt=tilt, strong=strong,
                 sig=sig, warns=t["warns"] + list(outer_warn or []), sup=sup, res=res, atr=atr,
-                rng=(lo_rng, hi_rng), advice=line, stop=stop, rr=rr, gates=gates,
+                rng=(lo_rng, hi_rng), advice=line, short=short, stop=stop, rr=rr, gates=gates,
                 ma5=float(r.ma5), ma20=float(r.ma20), ma60=float(r.ma60), K=float(r.K), D=float(r.D),
                 hist=float(r.mh), pctb=float(r.pctb),
                 vol_ratio=(float(r.Volume / r.vol_ref) if pd.notna(r.vol_ref) and r.vol_ref > 0 and r.Volume > 0 else None),
@@ -888,7 +907,78 @@ def post_discord(url, text):
 
 
 # ───────────────────────── 主流程 ─────────────────────────
-def build_messages(data):
+# ───────────────────────── 精簡版格式（預設）─────────────────────────
+TAGS = [("鈍化", "KD鈍化"), ("突破布林上軌", "過熱"), ("跌破布林下軌", "超跌"), ("乖離率", "乖離大"), ("收斂", "通道收斂")]
+
+
+def warn_tags(warns):
+    out = []
+    for w in warns:
+        for k, t in TAGS:
+            if k in w:
+                if t not in out:
+                    out.append(t)
+                break
+    return out
+
+
+def us_line(data):
+    parts, pcts = [], []
+    for sym, name, df in data["us"]:
+        d = add_ind(df)
+        pc = (d.iloc[-1].Close / d.iloc[-2].Close - 1) * 100
+        parts.append(f"{name.replace('(參考)', '')} {pct_s(pc)}")
+        if not name.startswith("費半"):
+            pcts.append(pc)
+    if not pcts:
+        return "美股：資料取得失敗"
+    avg = float(np.mean(pcts))
+    if all(x > 0 for x in pcts):
+        mood = "強勢" if avg >= 1 else "偏多"
+    elif all(x < 0 for x in pcts):
+        mood = "弱勢" if avg <= -1 else "偏空"
+    else:
+        mood = "分歧"
+    last = data["us"][0][2].index[-1]
+    return f"美股（{last:%m/%d}收）" + "｜".join(parts) + f" → {mood}"
+
+
+def fmt_index_compact(res, night, data):
+    if "error" in res:
+        return f"📈 大盤：⚠️ {res['error']}"
+    L = ["🌍 " + us_line(data)]
+    if night:
+        L.append(f"🌙 夜盤 {night['last']:,.0f} {pct_s(night['pct'])} → 推估開盤約 {res['ref']:,.0f}")
+    else:
+        L.append("🌙 夜盤：取得失敗（以昨收為基準）")
+    c, oi = res.get("chips"), data.get("fut_oi")
+    ch = (f"外資 {c['foreign']:+.0f}億｜投信 {c['trust']:+.0f}億｜自營 {c['dealer']:+.0f}億" if c else "法人資料取得失敗")
+    L.append("💰 " + ch + (f"｜外資期貨淨 {oi:+,.0f}口" if oi is not None else ""))
+    strong = "(強)" if res["strong"] else ""
+    L.append(f"📈 **大盤 {res['close']:,.0f} {pct_s(res['chg'])}｜{res['tilt']}{strong}** {res['score']:+.1f}")
+    L.append("　撐 " + "/".join(fp(v, "index") for v, _ in res["sup"]) + "｜壓 " + "/".join(fp(v, "index") for v, _ in res["res"]) +
+             f"｜預推 {fp(res['rng'][0], 'index')}–{fp(res['rng'][1], 'index')}")
+    tags = warn_tags(res["warns"])
+    L.append(f"　→ {res['short']}" + (f"　⚠️{' '.join(tags)}" if tags else ""))
+    if res["date"] < prev_weekday(data["today"]):
+        L.append(f"⚠️ 台股最新資料為 {res['date']:%m/%d}，前一營業日可能休市或資料未更新")
+    return "\n".join(L)
+
+
+def fmt_stock_compact(code, res):
+    if "error" in res:
+        return f"📌 {code} {res['name']}：⚠️ {res['error']}"
+    fund, chips = res["fund"], res["chips"]
+    tag = f"基本面{fund['grade'] if fund else '—'}・籌碼{chips['grade'] if chips else '—'}"
+    strong = "(強)" if res["strong"] else ""
+    tags = warn_tags(res["warns"])
+    return (f"📌 **{res['name']}** {fp(res['close'], 'stock')} {pct_s(res['chg'])}｜{res['tilt']}{strong}｜{tag}\n"
+            f"　撐{fp(res['sup'][0][0], 'stock')}／壓{fp(res['res'][0][0], 'stock')}"
+            f"｜預推{fp(res['rng'][0], 'stock')}–{fp(res['rng'][1], 'stock')}｜{res['short']}"
+            + (f"　⚠️{' '.join(tags)}" if tags else ""))
+
+
+def build_messages(data, detail=False):
     today = data["today"]
     banner = "【DEMO 合成資料，非真實行情】\n" if data.get("demo") else ""
     head = f"{banner}📊 **盤前報告｜{today:%Y-%m-%d}（{WD[today.weekday()]}）**"
@@ -904,6 +994,17 @@ def build_messages(data):
     missing = [f"{c} {n}" for c, n in WATCHLIST.items() if c not in data["stocks"]]
     llm = llm_commentary(facts_for_llm(idx_res, {c: r for c, r in stock_res.items() if "error" not in r}, night, us_avg)) \
         if "error" not in idx_res else None
+    detail = detail or os.getenv("REPORT_DETAIL") == "1"
+    if not detail:
+        L = [head, fmt_index_compact(idx_res, night, data), "", "**個股**"]
+        for code, r in stock_res.items():
+            L.append(fmt_stock_compact(code, r))
+        if missing:
+            L.append("⚠️ 價格資料取得失敗：" + "、".join(missing))
+        if llm and llm.get("market"):
+            L.append(f"🤖 {llm['market']}")
+        L.append("—\n條件式情境，非投資建議。完整版：執行時加 --detail")
+        return ["\n".join(L)]
     foot = "—\n以上為依既定規則計算的條件式情境，非投資建議。資料源：Yahoo/證交所/期交所，可能延遲或缺漏。"
     msgs = [head + "\n" + fmt_index(idx_res, us_text, night, data)]
     if llm and llm.get("market"):
@@ -953,17 +1054,19 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--check-sources", action="store_true")
+    ap.add_argument("--detail", action="store_true", help="輸出完整詳細版（預設為精簡版）")
     a = ap.parse_args()
     if a.check_sources:
         return check_sources()
     today = dt.datetime.now(TZ).date()
-    if today.weekday() >= 5 or today.isoformat() in NO_REPORT_DATES:
+    # 週末/休市日只擋「正式推播」；--demo、--dry-run 供測試，不受限
+    if (today.weekday() >= 5 or today.isoformat() in NO_REPORT_DATES) and not (a.demo or a.dry_run):
         print("今日非報告日，略過")
         return
     url = os.getenv("DISCORD_WEBHOOK_URL", "")
     try:
         data = collect_demo(today) if a.demo else collect_live(today)
-        msgs = build_messages(data)
+        msgs = build_messages(data, detail=a.detail)
     except Exception as e:
         err = f"⚠️ 盤前報告產生失敗：{e!r}"
         print(err, file=sys.stderr)
